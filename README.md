@@ -257,7 +257,3 @@ sysctl net.ipv4.tcp_congestion_control
 ## 📜 开源协议
 
 本项目采用 MIT 协议开源
-
----
-
-## 📜 开源协议
