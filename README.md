@@ -18,7 +18,7 @@
 
 ## 📖 项目介绍
 
-这是一个经过深度优化的BBR一键加速脚本，基于 [ylx2016/Linux-NetSpeed](https://github.com/ylx2016/Linux-NetSpeed) 项目改进而来。
+这是一个经过深度优化的BBR一键加速脚本。
 
 **主要改进：**
 - ✅ 修复所有已知BUG（CentOS源失败、GitHub依赖等）
@@ -67,13 +67,13 @@
 ### 一键安装命令
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/adsorgcn/bbr-script/main/newbbr.sh)
+bash <(curl -sL https://raw.githubusercontent.com/tianyeyuan/zenbbr/main/newbbr.sh)
 ```
 
 使用 wget：
 
 ```bash
-wget -O newbbr.sh https://raw.githubusercontent.com/adsorgcn/bbr-script/main/newbbr.sh && bash newbbr.sh
+wget -O newbbr.sh https://raw.githubusercontent.com/tianyeyuan/zenbbr/main/newbbr.sh && bash newbbr.sh
 ```
 
 ### 使用步骤
@@ -251,16 +251,12 @@ sysctl net.ipv4.tcp_congestion_control
 - ✅ 优化菜单显示
 
 ### v1.0.0 (2026-02-19)
-- 🎉 首次发布，基于ylx2016/Linux-NetSpeed深度优化
+- 🎉 首次发布
 - ✅ 代码精简75%，修复所有已知BUG
 
 ## 📜 开源协议
 
 本项目采用 MIT 协议开源
-
-## 🙏 致谢
-
-- 原始项目：[ylx2016/Linux-NetSpeed](https://github.com/ylx2016/Linux-NetSpeed)
 
 ---
 
