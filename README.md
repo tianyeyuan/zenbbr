@@ -250,6 +250,3 @@ sysctl net.ipv4.tcp_congestion_control
 - 🎉 首次发布
 - ✅ 代码精简75%，修复所有已知BUG
 
-## 📜 开源协议
-
-本项目采用 MIT 协议开源
