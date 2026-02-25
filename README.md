@@ -2,10 +2,6 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.3-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-![System](https://img.shields.io/badge/system-CentOS%20|%20Ubuntu%20|%20Debian-orange.svg)
-
 **一键全自动优化加速你的Linux服务器**
 
 适合Linux新手，自动检测依赖，智能优化配置
