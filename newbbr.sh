@@ -8,7 +8,7 @@ set -euo pipefail
 #=================================================
 #	System: CentOS 6/7, Debian 8+, Ubuntu 16+
 #	Description: 一键全自动优化加速你的服务器
-#	Version: 1.1.0
+#	Version: 1.2.0
 #=================================================
 
 RED='\033[0;31m'
@@ -17,7 +17,7 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-sh_ver="1.1.0"
+sh_ver="1.2.0"
 LOG_FILE="/var/log/zenbbr.log"
 
 DRY_RUN=0
@@ -99,6 +99,8 @@ fi
 
 log_info "检测到系统: $OS $VER ($ARCH)"
 
+# ========== 基础工具函数 ==========
+
 # 检查必要依赖并自动安装
 check_dependencies() {
     log_info "检查系统依赖..."
@@ -107,7 +109,6 @@ check_dependencies() {
     local PKG_INSTALL=""
     local DEPS=""
 
-    # 检测包管理器
     if [[ "$OS" =~ centos|rhel|fedora ]]; then
         PKG_MANAGER="yum"
         PKG_INSTALL="yum install -y"
@@ -121,7 +122,6 @@ check_dependencies() {
         return 0
     fi
     
-    # 检查并安装依赖
     local need_install=()
     for dep in $DEPS; do
         local installed=0
@@ -157,7 +157,6 @@ check_dependencies() {
             update-ca-certificates 2>/dev/null || true
         fi
         
-        # 简单验证
         if command -v curl &>/dev/null && command -v wget &>/dev/null; then
             log_info "依赖安装完成"
         else
@@ -168,24 +167,24 @@ check_dependencies() {
     fi
 }
 
-# 检查虚拟化类型
+# 检查虚拟化类型（返回全局变量 VIRT_TYPE）
+VIRT_TYPE="unknown"
 check_virt() {
     log_info "检查虚拟化类型..."
-    local virt_type="unknown"
     
     if command -v systemd-detect-virt &>/dev/null; then
-        virt_type=$(systemd-detect-virt || true)
+        VIRT_TYPE=$(systemd-detect-virt || true)
     elif command -v virt-what &>/dev/null; then
-        virt_type=$(virt-what | head -1 || true)
+        VIRT_TYPE=$(virt-what | head -1 || true)
     else
         if grep -q "openvz" /proc/vz/version 2>/dev/null || grep -q "openvz" /proc/cpuinfo 2>/dev/null; then
-            virt_type="openvz"
+            VIRT_TYPE="openvz"
         fi
     fi
     
-    log_info "虚拟化类型: ${virt_type}"
+    log_info "虚拟化类型: ${VIRT_TYPE}"
     
-    if [[ "$virt_type" == "openvz" ]]; then
+    if [[ "$VIRT_TYPE" == "openvz" ]]; then
         log_error "╔════════════════════════════════════════════╗"
         log_error "║  警告：检测到OpenVZ虚拟化                 ║"
         log_error "║  OpenVZ容器无法更换内核，无法启用BBR      ║"
@@ -243,7 +242,7 @@ check_network() {
         log_warn "网络连接正常但HTTPS访问受限"
         return 0
     else
-        log_error "网络连接失败，请检查网络设置。由于严格模式，将继续执行但可能失败。"
+        log_error "网络连接失败，请检查网络设置。"
         return 1 || true
     fi
 }
@@ -333,19 +332,39 @@ enabled=1
 EOF
     fi
     yum clean all >/dev/null 2>&1 || true
-    log_info "CentOS ${VER} Vault源配置已完成（原文件已备份至 ${backup_dir}，支持回滚即可将其复制回原目录）"
+    log_info "CentOS ${VER} Vault源配置已完成（原文件已备份至 ${backup_dir}）"
 }
+
+# ========== BBR 核心函数 ==========
 
 check_bbr_status() {
     local param
     param=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || true)
-    if [[ "$param" == "bbr" ]]; then
+    [[ "$param" == "bbr" ]]
+}
+
+# 获取内核信息（静默版本，不输出任何东西）
+# 返回: 0=最佳(5.4+), 1=可用(4.9+), 2=不支持
+get_kernel_bbr_level() {
+    local kernel_version major minor
+    kernel_version=$(uname -r | cut -d- -f1)
+    major=$(echo "$kernel_version" | cut -d. -f1 || true)
+    minor=$(echo "$kernel_version" | cut -d. -f2 || true)
+    
+    if [[ -z "$major" ]] || [[ -z "$minor" ]]; then
+        return 2
+    fi
+    
+    if [[ "$major" -gt 5 ]] || [[ "$major" -eq 5 && "$minor" -ge 4 ]]; then
         return 0
-    else
+    elif [[ "$major" -eq 4 && "$minor" -ge 9 ]]; then
         return 1
+    else
+        return 2
     fi
 }
 
+# 带日志输出的内核检测
 check_kernel_native_bbr() {
     local kernel_version major minor
     kernel_version=$(uname -r | cut -d- -f1)
@@ -416,6 +435,179 @@ EOF
     fi
 }
 
+# ========== 智能诊断（核心决策引擎） ==========
+
+smart_diagnose() {
+    echo ""
+    echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
+    echo -e "${BLUE}║              🔍 VPS 智能体检报告               ║${PLAIN}"
+    echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
+    echo ""
+    
+    # 第一层：收集信息
+    local kernel_version congestion qdisc bbr_loaded bbr_enabled kernel_level
+    kernel_version=$(uname -r)
+    congestion=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || true)
+    qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || true)
+    bbr_loaded=0
+    lsmod | grep -q bbr && bbr_loaded=1
+    bbr_enabled=0
+    check_bbr_status && bbr_enabled=1
+    
+    # 获取内核级别
+    kernel_level=2
+    get_kernel_bbr_level && kernel_level=0 || kernel_level=$?
+    
+    echo -e "  ${GREEN}系统${PLAIN}          $OS $VER ($ARCH)"
+    echo -e "  ${GREEN}内核${PLAIN}          $kernel_version"
+    echo -e "  ${GREEN}虚拟化${PLAIN}        $VIRT_TYPE"
+    echo -e "  ${GREEN}拥塞算法${PLAIN}      ${congestion:-未设置}"
+    echo -e "  ${GREEN}队列算法${PLAIN}      ${qdisc:-未设置}"
+    echo -e "  ${GREEN}BBR模块${PLAIN}        $([ $bbr_loaded -eq 1 ] && echo '✅ 已加载' || echo '❌ 未加载')"
+    echo -e "  ${GREEN}BBR状态${PLAIN}        $([ $bbr_enabled -eq 1 ] && echo '✅ 已启用' || echo '❌ 未启用')"
+    echo ""
+    
+    # 第二层：三层决策判断
+    echo -e "${BLUE}────────── 诊断结论 ──────────${PLAIN}"
+    echo ""
+    
+    # A. 已启用且正常
+    if [[ $bbr_enabled -eq 1 && $bbr_loaded -eq 1 ]]; then
+        echo -e "  ${GREEN}✅ BBR 已正常运行，无需任何操作！${PLAIN}"
+        echo ""
+        echo -e "  当前状态最优，拥塞算法=${GREEN}bbr${PLAIN}，模块已加载。"
+        echo -e "  您的网络已在最佳加速状态。"
+        echo ""
+        return 0
+    fi
+    
+    if [[ $bbr_enabled -eq 1 && $bbr_loaded -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠️  BBR 已配置但模块未加载${PLAIN}"
+        echo ""
+        echo -e "  sysctl 配置显示 bbr，但 lsmod 未检测到 tcp_bbr 模块。"
+        echo -e "  建议：重启系统后重新检查，或选择菜单 2 重新启用。"
+        echo ""
+        return 0
+    fi
+    
+    # B. 内核支持但未启用
+    if [[ $kernel_level -le 1 && $bbr_enabled -eq 0 ]]; then
+        echo -e "  ${GREEN}✅ 推荐启用 BBR${PLAIN}"
+        echo ""
+        if [[ $kernel_level -eq 0 ]]; then
+            echo -e "  当前内核 ${GREEN}${kernel_version}${PLAIN} 完美支持 BBR（5.4+最佳版本）。"
+        else
+            echo -e "  当前内核 ${YELLOW}${kernel_version}${PLAIN} 支持 BBR（4.9+ 基础支持）。"
+        fi
+        echo -e "  ${GREEN}只需一步配置即可启用，无需升级内核，零风险。${PLAIN}"
+        echo ""
+        
+        if [[ $AUTO_YES -eq 1 ]]; then
+            echo -e "  ${BLUE}[--yes] 自动执行启用...${PLAIN}"
+            enable_bbr || true
+        else
+            local do_enable
+            read -p "  是否立即启用 BBR？[Y/n]: " do_enable || true
+            if [[ "${do_enable:-Y}" =~ ^[Yy]$ ]]; then
+                enable_bbr || true
+            fi
+        fi
+        return 0
+    fi
+    
+    # C. 内核不支持 → 收益评估
+    if [[ $kernel_level -eq 2 ]]; then
+        echo -e "  ${YELLOW}⚠️  当前内核不支持 BBR，需要评估升级收益${PLAIN}"
+        echo ""
+        echo -e "  当前内核 ${RED}${kernel_version}${PLAIN} 版本过低（需要 4.9+）。"
+        echo ""
+        
+        # 收益评估
+        echo -e "${BLUE}────────── 收益评估 ──────────${PLAIN}"
+        echo ""
+        
+        local benefit_score=0
+        local benefit_reasons=()
+        local risk_reasons=()
+        
+        # 高延迟场景判断（通过 ping 外部服务器）
+        local avg_rtt
+        avg_rtt=$(ping -c 3 -W 3 8.8.8.8 2>/dev/null | tail -1 | awk -F'/' '{print int($5)}' || echo "0")
+        if [[ "$avg_rtt" -gt 100 ]]; then
+            benefit_score=$((benefit_score + 3))
+            benefit_reasons+=("高延迟环境 (RTT≈${avg_rtt}ms)，BBR 可提升 30-50% 吞吐量")
+        elif [[ "$avg_rtt" -gt 30 ]]; then
+            benefit_score=$((benefit_score + 1))
+            benefit_reasons+=("中等延迟环境 (RTT≈${avg_rtt}ms)，BBR 有一定提升")
+        else
+            benefit_reasons+=("低延迟环境 (RTT≈${avg_rtt}ms)，BBR 提升可能不明显")
+        fi
+        
+        # 虚拟化类型
+        if [[ "$VIRT_TYPE" == "openvz" ]]; then
+            risk_reasons+=("OpenVZ 虚拟化无法更换内核，升级必定失败")
+        elif [[ "$VIRT_TYPE" == "kvm" || "$VIRT_TYPE" == "none" ]]; then
+            benefit_score=$((benefit_score + 1))
+            benefit_reasons+=("虚拟化类型 ($VIRT_TYPE) 完全支持内核升级")
+        fi
+        
+        # 系统兼容性
+        if [[ "$OS" =~ debian|ubuntu ]]; then
+            benefit_score=$((benefit_score + 2))
+            benefit_reasons+=("$OS 系统内核升级成熟稳定，风险极低")
+        elif [[ "$OS" =~ centos ]]; then
+            if [[ -n "$VER" && "$VER" -ge 8 ]] 2>/dev/null; then
+                risk_reasons+=("CentOS 8+ 已停服，升级内核风险极高，强烈不推荐")
+            elif [[ "$VER" == "7" ]]; then
+                benefit_score=$((benefit_score + 1))
+                benefit_reasons+=("CentOS 7 可通过 ELRepo 升级，有一定风险但可行")
+            else
+                risk_reasons+=("CentOS $VER 版本过旧，升级内核风险较高")
+            fi
+        fi
+        
+        # 输出评估条目
+        for reason in "${benefit_reasons[@]}"; do
+            echo -e "  ${GREEN}＋${PLAIN} $reason"
+        done
+        for reason in "${risk_reasons[@]}"; do
+            echo -e "  ${RED}－${PLAIN} $reason"
+        done
+        echo ""
+        
+        # 给出总结性建议
+        echo -e "${BLUE}────────── 操作建议 ──────────${PLAIN}"
+        echo ""
+        
+        if [[ ${#risk_reasons[@]} -gt 0 && "$VIRT_TYPE" == "openvz" ]]; then
+            echo -e "  ${RED}❌ 不建议操作${PLAIN}"
+            echo -e "  OpenVZ 虚拟化无法更换内核，BBR 无法启用。"
+            echo -e "  建议更换为 KVM/Xen 虚拟化的 VPS。"
+        elif [[ "$OS" =~ centos ]] && [[ -n "$VER" && "$VER" -ge 8 ]] 2>/dev/null; then
+            echo -e "  ${RED}❌ 不建议操作${PLAIN}"
+            echo -e "  CentOS 8+ 已停服，升级内核极易导致系统损坏。"
+            echo -e "  强烈建议迁移到 Ubuntu 22.04+ 或 Debian 12+ 后再操作。"
+        elif [[ $benefit_score -ge 4 ]]; then
+            echo -e "  ${GREEN}✅ 推荐升级内核并启用 BBR${PLAIN}"
+            echo -e "  您的环境能从 BBR 获得明显收益，且升级风险可控。"
+            echo -e "  请选择菜单 ${GREEN}3${PLAIN} 进行内核升级。"
+        elif [[ $benefit_score -ge 2 ]]; then
+            echo -e "  ${YELLOW}⚠️  可选操作（收益不确定）${PLAIN}"
+            echo -e "  BBR 可能带来一定提升，但也需承担内核升级的风险。"
+            echo -e "  如果是生产环境，建议先在测试机上验证。"
+            echo -e "  如确定要升级，请选择菜单 ${YELLOW}3${PLAIN}。"
+        else
+            echo -e "  ${YELLOW}⚠️  不建议折腾${PLAIN}"
+            echo -e "  当前网络环境下 BBR 的收益可能不明显。"
+            echo -e "  升级内核存在一定风险，建议维持现状。"
+        fi
+        echo ""
+        return 0
+    fi
+}
+
+# ========== 内核升级函数 ==========
+
 upgrade_kernel_debian() {
     log_info "正在为 $OS $VER 验证内核状态..."
     
@@ -448,7 +640,7 @@ upgrade_kernel_debian() {
         local backup_suffix="bak_$(date +%s)"
         
         if [[ $DRY_RUN -eq 1 ]]; then
-            log_info "[DRY-RUN] 会备份 /etc/apt/sources.list 甚至 sources.list.d 下的所有文件，并替换 url"
+            log_info "[DRY-RUN] 会备份 /etc/apt/sources.list 及 sources.list.d 下的文件，并替换 url"
         else
             cp /etc/apt/sources.list "/etc/apt/sources.list.${backup_suffix}" 2>/dev/null || true
             if [[ "$OS" == "ubuntu" ]]; then
@@ -459,8 +651,8 @@ upgrade_kernel_debian() {
                 sed -i 's|http://security.debian.org|https://mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
             fi
             
+            # 兼容 Debian 12+ 的 .sources 格式
             if [[ -d /etc/apt/sources.list.d ]]; then
-                # 兼容 debian 12+ 的 .sources 格式或者部分 ubuntu 的 .list
                 find /etc/apt/sources.list.d/ -type f \( -name "*.list" -o -name "*.sources" \) | while read -r f; do
                     cp "$f" "${f}.${backup_suffix}" 2>/dev/null || true
                     sed -i 's|http://archive.ubuntu.com|https://mirrors.aliyun.com|g' "$f" 2>/dev/null || true
@@ -483,7 +675,6 @@ upgrade_kernel_debian() {
     local DPKG_ARCH
     DPKG_ARCH=$(dpkg --print-architecture)
     
-    # 局部取消严格模式，避免安装中途遇到无关错误导致跳出脚本
     set +e
     if [[ "$OS" == "ubuntu" ]]; then
         if [[ "$VER" =~ ^(20|22|24) ]]; then
@@ -508,6 +699,7 @@ upgrade_kernel_debian() {
         log_info "╔════════════════════════════════════════════╗"
         log_info "║  内核升级完成！                           ║"
         log_info "║  需要重启系统才能使用新内核               ║"
+        log_info "║  重启后再次运行脚本选 1 即可启用 BBR      ║"
         log_info "╚════════════════════════════════════════════╝"
         return 0
     else
@@ -611,7 +803,6 @@ upgrade_kernel_centos() {
         if [[ $success -eq 1 ]]; then
             log_info "配置GRUB启动项..."
             
-            # UEFI 探测
             local grub_cfg="/boot/grub2/grub.cfg"
             if [[ -d /sys/firmware/efi ]]; then
                 if [[ -f /boot/efi/EFI/centos/grub.cfg ]]; then
@@ -627,6 +818,7 @@ upgrade_kernel_centos() {
             log_info "╔════════════════════════════════════════════╗"
             log_info "║  内核升级完成！                           ║"
             log_info "║  需要重启系统才能使用新内核               ║"
+            log_info "║  重启后再次运行脚本选 1 即可启用 BBR      ║"
             log_info "╚════════════════════════════════════════════╝"
             return 0
         else
@@ -646,6 +838,47 @@ upgrade_kernel_centos() {
         return 1
     fi
 }
+
+# 升级内核（统一入口，自动判断发行版）
+upgrade_kernel() {
+    echo ""
+    log_warn "╔════════════════════════════════════════════════════╗"
+    log_warn "║  ⚠  内核升级为高风险操作，请确认以下事项：       ║"
+    log_warn "║  1. 已备份重要数据                               ║"
+    log_warn "║  2. 有 VNC/IPMI 等带外管理方式可恢复             ║"
+    log_warn "║  3. 非关键业务高峰期                             ║"
+    log_warn "╚════════════════════════════════════════════════════╝"
+    echo ""
+    
+    if [[ $AUTO_YES -eq 0 ]]; then
+        local confirm_upgrade
+        read -p "确认要升级内核？[y/N]: " confirm_upgrade || true
+        if [[ ! "${confirm_upgrade:-N}" =~ ^[Yy]$ ]]; then
+            log_warn "已取消内核升级"
+            return 0
+        fi
+    fi
+    
+    check_boot_space
+    
+    if [[ "$OS" =~ debian|ubuntu ]]; then
+        upgrade_kernel_debian || true
+    elif [[ "$OS" =~ centos|rhel ]]; then
+        upgrade_kernel_centos || true
+    else
+        log_error "当前系统 $OS 不支持自动升级内核"
+        return 1
+    fi
+    
+    local reboot_now="N"
+    if [[ $AUTO_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
+        read -p "是否现在重启系统? [y/N]: " reboot_now || true
+        reboot_now=${reboot_now:-N}
+    fi
+    [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
+}
+
+# ========== 旧内核清理 ==========
 
 remove_old_kernels() {
     log_info "检测并尝试卸载旧内核..."
@@ -689,7 +922,7 @@ remove_old_kernels() {
         installed_kernels=$(dpkg -l | awk '/^ii  linux-image-[0-9]/ {print $2}' || true)
         
         log_warn "当前运行内核: $current_kernel"
-        log_warn "系统中已发现的内核文件："
+        log_warn "系统中已发现的内核："
         echo "$installed_kernels"
         
         local confirm_remove="Y"
@@ -719,6 +952,8 @@ remove_old_kernels() {
     fi
 }
 
+# ========== 状态显示 ==========
+
 show_status() {
     echo -e "\n${BLUE}==================== 系统状态 ====================${PLAIN}"
     echo -e "${GREEN}系统:${PLAIN} $OS $VER"
@@ -737,7 +972,7 @@ show_status() {
         echo -e "${GREEN}BBR模块:${PLAIN} ❌ 未加载"
     fi
     
-    local qdisc congestion   
+    local qdisc congestion
     qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || true)
     echo -e "${GREEN}队列算法:${PLAIN} ${qdisc:-未设置}"
     
@@ -747,67 +982,42 @@ show_status() {
     echo -e "${BLUE}=================================================${PLAIN}\n"
 }
 
+# ========== 主菜单（while 循环，非递归） ==========
+
 show_menu() {
     while true; do
         clear
         echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
-        echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver} (优化版)        ║${PLAIN}"
-        echo -e "${BLUE}║       支持 Debian 12+ / Ubuntu 自适应优化        ║${PLAIN}"
-        echo -e "${BLUE}║                                                 ║${PLAIN}"
+        echo -e "${BLUE}║       BBR一键加速脚本 v${sh_ver}               ║${PLAIN}"
+        echo -e "${BLUE}║       智能诊断 · 按需加速 · 安全可控           ║${PLAIN}"
         echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
         echo ""
-        show_status
-        echo -e "${GREEN}1.${PLAIN} 安装/启用 BBR ${YELLOW}(推荐先选此项)${PLAIN}"
-        echo -e "${GREEN}2.${PLAIN} 升级内核（Ubuntu/Debian）"
-        echo -e "${GREEN}3.${PLAIN} 升级内核（CentOS 7）"
-        echo -e "${GREEN}4.${PLAIN} 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}"
-        echo -e "${GREEN}5.${PLAIN} 查看状态"
-        echo " -------------"
-        echo -e "${GREEN}0.${PLAIN} 退出"
+        echo -e " ${GREEN}1.${PLAIN} 🔍 智能诊断 ${YELLOW}(推荐 — 先体检再决定)${PLAIN}"
+        echo -e " ${GREEN}2.${PLAIN} ⚡ 仅启用BBR ${YELLOW}(内核已支持时零风险)${PLAIN}"
+        echo -e " ${GREEN}3.${PLAIN} 🔧 升级内核后启用BBR ${RED}(高风险)${PLAIN}"
+        echo -e " ${GREEN}4.${PLAIN} 🧹 清理旧内核 ${YELLOW}(释放/boot空间)${PLAIN}"
+        echo -e " ${GREEN}5.${PLAIN} 📊 查看状态"
+        echo " ─────────────"
+        echo -e " ${GREEN}0.${PLAIN} 退出"
         echo ""
         
         local choice
-        read -p "请选择操作 [0-5]: " choice || true
+        read -p " 请选择操作 [0-5]: " choice || true
         choice=${choice:-0}
         
         case $choice in
             1)
+                smart_diagnose
+                ;;
+            2)
                 if check_kernel_native_bbr; then
                     enable_bbr || true
                 else
-                    log_warn "当前内核不支持BBR，请先升级内核"
-                    log_info "提示：Ubuntu/Debian选2，CentOS选3"
-                fi
-                ;;
-            2)
-                if [[ "$OS" =~ debian|ubuntu ]]; then
-                    check_boot_space
-                    upgrade_kernel_debian || true
-                    
-                    local reboot_now="N"
-                    if [[ $AUTO_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
-                        read -p "是否现在重启? [y/N]: " reboot_now || true
-                        reboot_now=${reboot_now:-N}
-                    fi
-                    [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-                else
-                    log_error "此选项仅适用于Ubuntu/Debian"
+                    log_warn "当前内核不支持BBR，请先选择 1 进行智能诊断评估"
                 fi
                 ;;
             3)
-                if [[ "$OS" =~ centos|rhel ]]; then
-                    check_boot_space
-                    upgrade_kernel_centos || true
-                    
-                    local reboot_now="N"
-                    if [[ $AUTO_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
-                        read -p "是否现在重启? [y/N]: " reboot_now || true
-                        reboot_now=${reboot_now:-N}
-                    fi
-                    [[ "$reboot_now" =~ ^[Yy]$ ]] && reboot
-                else
-                    log_error "此选项仅适用于CentOS"
-                fi
+                upgrade_kernel
                 ;;
             4)
                 remove_old_kernels || true
@@ -816,7 +1026,7 @@ show_menu() {
                 show_status
                 ;;
             0)
-                log_info "感谢您的使用！日志及记录详见 $LOG_FILE"
+                log_info "感谢使用！日志详见 $LOG_FILE"
                 exit 0
                 ;;
             *)
@@ -826,14 +1036,15 @@ show_menu() {
         
         echo ""
         if [[ $AUTO_YES -eq 0 ]]; then
-            read -p "按回车键继续..." || true
+            read -p " 按回车键返回主菜单..." || true
         else
             sleep 2
         fi
     done
 }
 
-# 脚本入口前的预检查
+# ========== 脚本入口 ==========
+
 echo -e "${BLUE}╔═════════════════════════════════════════════════╗${PLAIN}"
 echo -e "${BLUE}║            执行初始检测...                      ║${PLAIN}"
 echo -e "${BLUE}╚═════════════════════════════════════════════════╝${PLAIN}"
@@ -845,30 +1056,16 @@ check_virt || true
 fixCentOSRepo || true
 
 echo ""
-log_info "系统预设和依赖检查完成完毕！"
+log_info "系统预检完成！"
 sleep 1
 
+# 命令行自动化模式
 if [[ $DRY_RUN -eq 1 || $AUTO_YES -eq 1 || $BBR_ONLY -eq 1 ]]; then
-    log_info "当前已启用自动化命令行指令 [--dry-run / --yes / --bbr-only]"
-    log_info "自动化流程执行开始..."
-    
-    if check_kernel_native_bbr; then
-        enable_bbr || true
-    else
-        if [[ "$OS" =~ debian|ubuntu ]]; then
-            check_boot_space || true
-            upgrade_kernel_debian || true
-            log_warn "内核已升级，要求重启机器后再次调用以正式开启 BBR。"
-        elif [[ "$OS" =~ centos|rhel ]]; then
-            check_boot_space || true
-            upgrade_kernel_centos || true
-            log_warn "内核已升级，要求重启机器后再次调用以正式开启 BBR。"
-        else
-            log_error "不支持直接升级内核的自动化操作。"
-        fi
-    fi
+    log_info "当前使用命令行参数模式 [--dry-run / --yes / --bbr-only]"
+    log_info "自动执行智能诊断..."
+    smart_diagnose
     exit 0
 fi
 
-# 若非参数化自动化启动，进入交互式主菜单
+# 交互式菜单
 show_menu
